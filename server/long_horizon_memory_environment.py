@@ -52,8 +52,8 @@ class LongHorizonMemoryEnvironment(Environment):
 
     APPEND_RELEVANT_REWARD = 0.18
     APPEND_IRRELEVANT_PENALTY = -0.14
-    NOOP_IRRELEVANT_REWARD = 0.05
-    NOOP_RELEVANT_PENALTY = -0.16
+    NOOP_IRRELEVANT_REWARD = 0.02   # reduced from 0.05 — narrows the "free noop" attractor
+    NOOP_RELEVANT_PENALTY = -0.40   # raised from -0.16 — breaks always-noop collapse
 
     REWRITE_RELEVANT_BASE_REWARD = 0.08
     REWRITE_IRRELEVANT_PENALTY = -0.02
