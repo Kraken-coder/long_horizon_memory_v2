@@ -47,7 +47,7 @@ class LongHorizonMemoryEnvironment(Environment):
 
     SUPPORTS_CONCURRENT_SESSIONS: bool = True
 
-    MEMORY_TOKEN_BUDGET = 160
+    MEMORY_TOKEN_BUDGET = 250
     MAX_REWRITE_GROWTH_RATIO = 1.40
 
     APPEND_RELEVANT_REWARD = 0.18
@@ -62,6 +62,13 @@ class LongHorizonMemoryEnvironment(Environment):
     QUALITY_DELTA_WEIGHT = 0.15
     POTENTIAL_SHAPING_WEIGHT = 0.45
     TERMINAL_WEIGHT = 0.50
+
+    # Counterfactual and LLM-based rewards
+    COUNTERFACTUAL_WEIGHT = 0.20
+    USE_LLM_JUDGE = True  # ALWAYS ON - LLM answers questions, similarity judges
+    OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434")
+    QA_MODEL = os.getenv("QA_MODEL", "llama3.2:1b")
+    JUDGE_MODEL = os.getenv("JUDGE_MODEL", "llama3.2:1b")  # Not used anymore (kept for compatibility)
 
     def __init__(self):
         episodes_path = Path(__file__).with_name("episodes_extreme_30.json")
@@ -413,11 +420,226 @@ class LongHorizonMemoryEnvironment(Environment):
             return None
         return self.messages[self.total_message_number]
 
+    def _call_qa_model(self, memory: str, question: str) -> str:
+        """
+        Use external LLM to answer question based on memory.
+
+        This simulates how a real user would query the memory system.
+
+        Args:
+            memory: The compressed memory string
+            question: Question to answer
+
+        Returns:
+            LLM's predicted answer
+        """
+        if not memory.strip():
+            return ""
+
+        prompt = f"""Based ONLY on the following memory, answer the question concisely.
+If the memory doesn't contain the answer, say "Unknown".
+
+Memory:
+{memory}
+
+Question: {question}
+
+Answer (be brief):"""
+
+        try:
+            import requests
+
+            response = requests.post(
+                f"{self.OLLAMA_URL}/api/generate",
+                json={
+                    "model": self.QA_MODEL,
+                    "prompt": prompt,
+                    "stream": False,
+                    "options": {
+                        "temperature": 0.1,
+                        "num_predict": 50,
+                    },
+                },
+                timeout=10,
+            )
+
+            if response.status_code == 200:
+                answer = response.json().get("response", "").strip()
+                return answer
+            else:
+                return self._answer_question(memory, question)
+
+        except Exception:
+            return self._answer_question(memory, question)
+
+    def _judge_answer_quality(
+        self, question: str, predicted: str, ground_truth: str
+    ) -> float:
+        """
+        Use LLM to judge how well predicted answer matches ground truth.
+
+        This is more nuanced than string similarity - it understands semantics,
+        paraphrasing, and partial correctness.
+
+        Args:
+            question: The question being answered
+            predicted: LLM's predicted answer from memory
+            ground_truth: Correct answer from dataset
+
+        Returns:
+            Score from 0.0 (completely wrong) to 1.0 (perfect)
+        """
+        if not predicted.strip() or not ground_truth.strip():
+            return 0.0
+
+        prompt = f"""You are evaluating QA system answers. Rate how well the Predicted answer matches the Ground Truth for the given Question.
+
+Question: {question}
+Ground Truth: {ground_truth}
+Predicted: {predicted}
+
+Rating criteria:
+- 1.0: Perfect match or equivalent meaning
+- 0.7-0.9: Correct but incomplete or slightly off
+- 0.4-0.6: Partially correct
+- 0.1-0.3: Wrong but related
+- 0.0: Completely wrong or unrelated
+
+Provide ONLY a decimal score between 0.0 and 1.0, nothing else.
+Score:"""
+
+        try:
+            import requests
+
+            response = requests.post(
+                f"{self.OLLAMA_URL}/api/generate",
+                json={
+                    "model": self.JUDGE_MODEL,
+                    "prompt": prompt,
+                    "stream": False,
+                    "options": {"temperature": 0.0},
+                },
+                timeout=15,
+            )
+
+            if response.status_code == 200:
+                text = response.json().get("response", "0.0").strip()
+                match = re.search(r"(\d+\.?\d*)", text)
+                if match:
+                    score = float(match.group(1))
+                    return max(0.0, min(1.0, score))
+
+            return self._hybrid_similarity(predicted, ground_truth)
+
+        except Exception:
+            return self._hybrid_similarity(predicted, ground_truth)
+
+    def _llm_qa_score(self, memory_text: str) -> Dict[str, float]:
+        """
+        Calculate QA performance using actual LLM instead of string matching.
+
+        This replaces the heuristic _qa_metrics with real LLM-generated answers
+        judged by another LLM.
+
+        Returns:
+            Dictionary with qa_score and other metrics
+        """
+        if not self.questions:
+            return {"qa_score": 0.0, "llm_qa_score": 0.0}
+
+        scores = []
+        llm_scores = []
+
+        for q in self.questions:
+            question = str(q.get("question", ""))
+            ground_truth = str(q.get("answer", "")).strip()
+
+            if not ground_truth:
+                continue
+
+            predicted = self._call_qa_model(memory_text, question)
+
+            if self.USE_LLM_JUDGE:
+                llm_score = self._judge_answer_quality(question, predicted, ground_truth)
+                llm_scores.append(llm_score)
+
+            similarity_score = self._hybrid_similarity(predicted, ground_truth)
+            scores.append(similarity_score)
+
+        result = {
+            "qa_score": sum(scores) / len(scores) if scores else 0.0,
+        }
+
+        if llm_scores:
+            result["llm_qa_score"] = sum(llm_scores) / len(llm_scores)
+
+        return result
+
+    def _counterfactual_reward(
+        self,
+        operation: str,
+        old_memory: str,
+        new_memory: str,
+        message_text: str,
+    ) -> float:
+        """
+        Calculate advantage of chosen action vs alternatives.
+
+        Simulates "what if I had chosen differently?" and rewards
+        the agent for choosing actions that improve quality more than alternatives.
+
+        Args:
+            operation: Action taken ("append", "noop", "rewrite")
+            old_memory: Memory before action
+            new_memory: Memory after action
+            message_text: Current message being processed
+
+        Returns:
+            Counterfactual advantage bonus/penalty
+        """
+        actual_quality = self._quality_score(new_memory)
+
+        if operation == "append":
+            # What if we had done noop instead?
+            noop_quality = self._quality_score(old_memory)
+            advantage = actual_quality - noop_quality
+
+        elif operation == "noop":
+            # What if we had appended instead?
+            hypothetical_append = self._normalize_memory(
+                f"{old_memory}\n{message_text}" if old_memory else message_text
+            )
+            append_quality = self._quality_score(hypothetical_append)
+            advantage = actual_quality - append_quality
+
+        elif operation == "rewrite":
+            # What if we had kept old memory?
+            noop_quality = self._quality_score(old_memory)
+            advantage = actual_quality - noop_quality
+
+        else:
+            return 0.0
+
+        return self.COUNTERFACTUAL_WEIGHT * advantage
+
     def _terminal_bonus(self) -> float:
-        qa_metrics = self._qa_metrics(self.memory_text)
-        qa_score = qa_metrics["qa_score"]
-        exact_hit_rate = qa_metrics["exact_hit_rate"]
-        answerable_rate = qa_metrics["answerable_rate"]
+        # Use LLM to answer questions if enabled
+        if self.USE_LLM_JUDGE:
+            # LLM answers questions, similarity judges them (12 API calls)
+            llm_metrics = self._llm_qa_score(self.memory_text)
+            qa_score = llm_metrics["qa_score"]
+
+            # Still use heuristic for exact_hit and answerable_rate
+            baseline_metrics = self._qa_metrics(self.memory_text)
+            exact_hit_rate = baseline_metrics["exact_hit_rate"]
+            answerable_rate = baseline_metrics["answerable_rate"]
+        else:
+            # Pure heuristic (no LLM calls)
+            qa_metrics = self._qa_metrics(self.memory_text)
+            qa_score = qa_metrics["qa_score"]
+            exact_hit_rate = qa_metrics["exact_hit_rate"]
+            answerable_rate = qa_metrics["answerable_rate"]
+
         fact_coverage = self._fact_coverage(self.memory_text)
         relevance = self._memory_relevance_similarity(self.memory_text)
 
@@ -489,6 +711,9 @@ class LongHorizonMemoryEnvironment(Environment):
         breakdown: Dict[str, float] = {}
         prev_potential = self._last_potential_score
 
+        # Save old memory for counterfactual calculation
+        old_memory = self.memory_text
+
         operation = action.operation
         if operation == "append":
             if message_is_relevant:
@@ -541,6 +766,17 @@ class LongHorizonMemoryEnvironment(Environment):
         if overflow_penalty > 0:
             reward -= overflow_penalty
             breakdown["memory_overflow_penalty"] = -overflow_penalty
+
+        # Add counterfactual reward for append/noop/rewrite
+        if operation in ["append", "noop", "rewrite"]:
+            counterfactual = self._counterfactual_reward(
+                operation=operation,
+                old_memory=old_memory,
+                new_memory=self.memory_text,
+                message_text=message_text,
+            )
+            reward += counterfactual
+            breakdown["counterfactual_advantage"] = counterfactual
 
         new_quality = self._quality_score(self.memory_text)
         quality_delta = new_quality - self._last_quality_score

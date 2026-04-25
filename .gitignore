@@ -70,3 +70,9 @@ coverage.xml
 *.tmp
 *.bak
 *.swp
+
+REWARD_SYSTEM_GUIDE.md
+demo_llm_judge.py
+example_usage.py
+test_new_rewards.py
+train_local_ppo.py
